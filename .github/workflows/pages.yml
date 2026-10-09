@@ -1,9 +1,10 @@
 name: Publish design-system Pages
 
-run-name: Pages ${{ github.event.client_payload.sha || github.event.inputs.sha }}
+run-name: Pages ${{ github.event.client_payload.tag || github.event.inputs.tag || github.event.client_payload.sha || github.event.inputs.sha }}
 
 # Started from Seechange-edu/frontend-component (.github/workflows/dispatch-pages.yml),
-# which sends repository_dispatch `pages` { sha } with ACTION_TOKEN.
+# which sends repository_dispatch `pages` { sha, tag, webhook } with ACTION_TOKEN.
+# The webhook is not stored in this repo. Do not print the payload.
 # This public repo checks out that private sha, builds dist/, and deploys
 # GitHub Pages. One site; each product is a path (/thinkinglab/, …).
 #
@@ -21,6 +22,10 @@ on:
         description: 40-character commit on Seechange-edu/frontend-component
         required: true
         type: string
+      tag:
+        description: Tag or ref name to show on the Teams card
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -37,10 +42,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      tag: ${{ steps.check.outputs.tag }}
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Check the request
+        id: check
         env:
           SHA: ${{ github.event.client_payload.sha || github.event.inputs.sha }}
+          TAG: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
           TOKEN: ${{ secrets.ACTION_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
@@ -52,7 +63,15 @@ jobs:
             echo "::error::sha is not a 40-character commit id."
             exit 1
           fi
+          if [ -n "$TAG" ] && { [ "${#TAG}" -gt 100 ] || ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._/-]+$'; }; then
+            echo "::error::tag name is not usable."
+            exit 1
+          fi
           echo "SHA=$SHA" >> "$GITHUB_ENV"
+          {
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout source
         uses: actions/checkout@v4
@@ -75,3 +94,87 @@ jobs:
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # Notification only. A Teams outage must not turn a published site into a failed run.
+  # The webhook arrives from the private repo. It is not stored here. Mask it
+  # before any command can print it; this log is public.
+  notify:
+    needs: deploy
+    if: always() && needs.deploy.result != 'cancelled'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tell Teams
+        env:
+          WEBHOOK: ${{ github.event.client_payload.webhook }}
+          STATUS: ${{ needs.deploy.result }}
+          TAG: ${{ needs.deploy.outputs.tag }}
+          SHA: ${{ needs.deploy.outputs.sha }}
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK}" ]; then
+            echo "::notice::No Teams webhook was sent; skipping Teams."
+            exit 0
+          fi
+          if [ "${#WEBHOOK}" -gt 2048 ] || ! printf '%s' "$WEBHOOK" | grep -Eq '^https://[^[:space:]]+$'; then
+            echo "::error::Teams webhook from the dispatch is not an https URL. Skipping Teams."
+            exit 0
+          fi
+          printf '%s\n' "::add-mask::${WEBHOOK}"
+          case "$WEBHOOK" in
+            *%*) printf '%s\n' "::add-mask::${WEBHOOK//%/%25}" ;;
+          esac
+          SHORT=$(printf '%s' "$SHA" | cut -c1-7)
+          jq -n \
+            --arg status "$STATUS" \
+            --arg tag "${TAG:-"(none)"}" \
+            --arg sha "$SHORT" \
+            --arg actor "$ACTOR" \
+            --arg page_url "$PAGE_URL" \
+            --arg run_url "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    {
+                      type: "TextBlock",
+                      text: (if $status == "success" then "✅ Pages published" else "❌ Pages failed" end),
+                      weight: "Bolder",
+                      size: "Medium",
+                      color: (if $status == "success" then "Good" else "Attention" end),
+                      wrap: true
+                    },
+                    {
+                      type: "TextBlock",
+                      text: "frontend-component",
+                      spacing: "None",
+                      isSubtle: true,
+                      wrap: true
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        { title: "Tag", value: $tag },
+                        { title: "Commit", value: $sha },
+                        { title: "Result", value: $status },
+                        { title: "By", value: $actor }
+                      ]
+                    }
+                  ],
+                  actions: (
+                    (if $page_url != "" then [{ type: "Action.OpenUrl", title: "Open site", url: $page_url }] else [] end)
+                    + [{ type: "Action.OpenUrl", title: "View run", url: $run_url }]
+                  )
+                }
+              }]
+            }' \
+          | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK" >/dev/null \
+            || echo "::warning::Could not post to Teams."
