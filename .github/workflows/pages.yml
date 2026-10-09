@@ -1,0 +1,77 @@
+name: Publish design-system Pages
+
+run-name: Pages ${{ github.event.client_payload.sha || github.event.inputs.sha }}
+
+# Started from Seechange-edu/frontend-component (.github/workflows/dispatch-pages.yml),
+# which sends repository_dispatch `pages` { sha } with ACTION_TOKEN.
+# This public repo checks out that private sha, builds dist/, and deploys
+# GitHub Pages. One site; each product is a path (/thinkinglab/, …).
+#
+# repository_dispatch runs the workflow file on this repo's default branch.
+# The pages themselves come from the private sha.
+#
+# This repository is public: logs and the published site are world-readable.
+# The preview is meant to be public. Do not print ACTION_TOKEN.
+on:
+  repository_dispatch:
+    types: [pages]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 40-character commit on Seechange-edu/frontend-component
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the request
+        env:
+          SHA: ${{ github.event.client_payload.sha || github.event.inputs.sha }}
+          TOKEN: ${{ secrets.ACTION_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::ACTION_TOKEN is empty. This repo needs it to read Seechange-edu/frontend-component."
+            exit 1
+          fi
+          # Length rejects a newline hiding extra env lines. grep alone matches one line.
+          if [ "${#SHA}" -ne 40 ] || ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::sha is not a 40-character commit id."
+            exit 1
+          fi
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Seechange-edu/frontend-component
+          ref: ${{ env.SHA }}
+          token: ${{ secrets.ACTION_TOKEN }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build static site
+        run: node scripts/build-pages.mjs
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
